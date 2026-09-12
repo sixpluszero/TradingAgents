@@ -85,6 +85,7 @@ class TradingAgentsGraph:
         debug=False,
         config: dict[str, Any] = None,
         callbacks: list | None = None,
+        progress_callback=None,
     ):
         """Initialize the trading agents graph and components.
 
@@ -97,6 +98,7 @@ class TradingAgentsGraph:
         self.debug = debug
         self.config = config or DEFAULT_CONFIG
         self.callbacks = callbacks or []
+        self.progress_callback = progress_callback
 
         # Update the interface's config
         set_config(self.config)
@@ -205,10 +207,13 @@ class TradingAgentsGraph:
             key = "max_output_tokens" if provider == "google" else "max_tokens"
             kwargs[key] = _coerce_max_tokens(max_tokens)
 
+        if self.config.get("request_timeout") is not None:
+            kwargs["timeout"] = float(self.config["request_timeout"])
         return kwargs
 
     def _create_tool_nodes(self) -> dict[str, ToolNode]:
         """Create tool nodes for different data sources using abstract methods."""
+        from tradingagents.agents.analysts.fund_profile import get_fund_or_index_profile
         return {
             "market": ToolNode(
                 [
@@ -241,6 +246,7 @@ class TradingAgentsGraph:
             "fundamentals": ToolNode(
                 [
                     # Fundamental analysis tools
+                    get_fund_or_index_profile,
                     get_fundamentals,
                     get_balance_sheet,
                     get_cashflow,
@@ -374,7 +380,10 @@ class TradingAgentsGraph:
         graph regardless of entry point.
         """
         identity = resolve_instrument_identity(ticker)
-        return build_instrument_context(ticker, asset_type, identity)
+        context = build_instrument_context(ticker, asset_type, identity)
+        if self.config.get("security_type") in ("etf", "index"):
+            context += f" This security is an {self.config['security_type']}, not an operating company. Do not infer corporate financials."
+        return context
 
     def _memory_as_of(self, trade_date) -> str | None:
         """Point-in-time cutoff for past-context lessons (#1251).
@@ -420,9 +429,19 @@ class TradingAgentsGraph:
         self.ticker = company_name
 
         # Resolve any pending memory-log entries for this ticker before the pipeline runs.
-        self._resolve_pending_entries(company_name)
+        # A service owns an isolated memory/checkpoint per run. Resuming the same
+        # completed run must not reflect on its own decision or call the model.
+        if not self.config.get("preserve_completed_checkpoint", False):
+            self._resolve_pending_entries(company_name)
 
         with self.checkpoint_scope(company_name, trade_date, asset_type) as thread_id_value:
+            if self.config.get("preserve_completed_checkpoint", False) and self._resuming:
+                snapshot = self.graph.get_state({"configurable": {"thread_id": thread_id_value}})
+                if not snapshot.next and snapshot.values.get("final_trade_decision"):
+                    self.curr_state = snapshot.values
+                    if self.progress_callback:
+                        self.progress_callback(snapshot.values)
+                    return snapshot.values, self.process_signal(snapshot.values["final_trade_decision"])
             return self._run_graph(
                 company_name, trade_date, asset_type=asset_type,
                 checkpoint_thread_id=thread_id_value,
@@ -485,7 +504,7 @@ class TradingAgentsGraph:
 
     def clear_checkpoint_on_success(self, company_name, trade_date, asset_type: str = "stock"):
         """Drop a completed run's checkpoint so a later run starts fresh (#1249)."""
-        if self.config.get("checkpoint_enabled"):
+        if self.config.get("checkpoint_enabled") and not self.config.get("preserve_completed_checkpoint", False):
             clear_checkpoint(
                 self.config["data_cache_dir"], company_name, str(trade_date),
                 self._run_signature(asset_type),
@@ -524,7 +543,7 @@ class TradingAgentsGraph:
             past_context=past_context,
             instrument_context=instrument_context,
         )
-        args = self.propagator.get_graph_args()
+        args = self.propagator.get_graph_args(callbacks=self.callbacks)
 
         # Inject the checkpoint thread_id (from checkpoint_scope) so the same
         # ticker+date+graph-shape resumes; a different one starts fresh (#1089).
@@ -533,17 +552,19 @@ class TradingAgentsGraph:
 
         # None resumes an existing checkpoint; init_agent_state starts fresh (#1249).
         graph_input = self.checkpoint_input(init_agent_state)
-        if self.debug:
+        if self.debug or self.progress_callback:
             trace = []
             last_printed = None
             for chunk in self.graph.stream(graph_input, **args):
+                if self.progress_callback:
+                    self.progress_callback(chunk)
                 if chunk["messages"]:
                     msg = chunk["messages"][-1]
                     # Nodes after the trader don't append to messages, so the
                     # same trailing message repeats across chunks. Print it only
                     # when it changes (#1027); the trace/state merge is unchanged.
                     signature = (type(msg).__name__, getattr(msg, "content", None))
-                    if signature != last_printed:
+                    if self.debug and signature != last_printed:
                         msg.pretty_print()
                         last_printed = signature
                     trace.append(chunk)

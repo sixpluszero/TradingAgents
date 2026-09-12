@@ -168,11 +168,9 @@ def select_research_depth() -> int:
     """Select research depth using an interactive selection."""
 
     # Define research depth options with their corresponding values
-    DEPTH_OPTIONS = [
-        ("Shallow - Quick research, few debate and strategy discussion rounds", 1),
-        ("Medium - Middle ground, moderate debate rounds and strategy discussion", 3),
-        ("Deep - Comprehensive research, in depth debate and strategy discussion", 5),
-    ]
+    from tradingagents.service import RESEARCH_DEPTHS
+
+    DEPTH_OPTIONS = RESEARCH_DEPTHS
 
     choice = questionary.select(
         "Select Your [Research Depth]:",

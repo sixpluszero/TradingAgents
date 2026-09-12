@@ -29,6 +29,21 @@ def create_fundamentals_analyst(llm):
             + get_language_instruction(),
         )
 
+        from tradingagents.dataflows.config import get_config
+        security_type = get_config().get("security_type")
+        if security_type in ("etf", "index"):
+            from .fund_profile import get_fund_or_index_profile
+            tools = [get_fund_or_index_profile]
+            system_message = (
+                f"Analyze this {security_type}, not a company. Read the supplied evidence snapshot. "
+                "For an ETF discuss mandate, costs, holdings, concentration and exposures only when evidenced. "
+                "For an index discuss documented composition, geographic exposure and macro sensitivities. "
+                "Never request or invent corporate income statements, cashflow or balance sheets. "
+                "Clearly separate unavailable fields, observation dates and unverified interpretation. "
+                "Current profile data is not historical point-in-time evidence. End with a summary table. "
+                + get_language_instruction()
+            )
+
         prompt = ChatPromptTemplate.from_messages(
             [
                 (
